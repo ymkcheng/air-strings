@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>空中撥弦</title>
+<style>
+  :root { --bg:#0b0d10; --ink:#e8eef2; --dim:#8a96a0; --accent:#3ddc97; --panel:rgba(10,14,18,.72); }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font-family: -apple-system, "PingFang TC", "Noto Sans TC", sans-serif; overflow:hidden; }
+  canvas { position:fixed; inset:0; width:100vw; height:100vh; display:block; touch-action:none; }
+  body { overscroll-behavior:none; -webkit-user-select:none; user-select:none; }
+  @media (max-width: 600px) { #help { font-size:12px; gap:6px 14px; } #status { font-size:13px; } }
+  #status { position:fixed; top:16px; left:16px; padding:8px 14px; border-radius:10px;
+    background:var(--panel); font-size:14px; }
+  #status b { color:var(--accent); font-weight:600; }
+  #help { position:fixed; left:16px; right:16px; bottom:16px; padding:10px 16px; border-radius:10px;
+    background:var(--panel); font-size:13px; color:var(--dim); display:flex; gap:24px; flex-wrap:wrap; }
+  #help span b { color:var(--ink); font-weight:600; }
+  #start { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    flex-direction:column; gap:14px; background:var(--bg); z-index:5; padding:0 24px; text-align:center; }
+  #start h1 { margin:0; font-size:28px; letter-spacing:.08em; }
+  #start p { margin:0; color:var(--dim); font-size:14px; }
+  #start button { margin-top:8px; padding:12px 28px; font-size:16px; border-radius:999px; border:0;
+    background:var(--accent); color:#06281a; cursor:pointer; font-weight:600; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="status">準備中</div>
+<div id="help">
+  <span><b>1.</b> 雙手拇指食指捏住，拉出一條弦</span>
+  <span><b>2.</b> 捏住弦的端點拉走，改變長度就改變音高（越長越低）</span>
+  <span><b>3.</b> 手指劃過弦就會響</span>
+  <span>按 C 清掉所有弦</span>
+</div>
+<div id="start">
+  <h1>空中撥弦</h1>
+  <p>需要開鏡頭與聲音。鏡頭打不開時改用滑鼠或手指：在空白處拖曳拉出弦，劃過弦就彈。手機請立在桌上，空出雙手。</p>
+  <button id="go">開始</button>
+</div>
+<video id="v" playsinline muted style="display:none"></video>
+
+<script type="module">
+// ---------- 設定 ----------
+const MP_VER = "1.2.0";
+const MAX_STRINGS = 7;
+const PINCH_ON = 0.33, PINCH_OFF = 0.48;     // 捏住與放開的門檻（拇指到食指距離 / 手掌大小）
+const GRAB_RADIUS = 40;                       // 捏住端點的判定範圍（像素）
+const TIPS = [4, 8, 12, 16, 20];              // 五根手指的指尖
+const NOTE = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+const HAND_LINKS = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+const video = document.getElementById("v");
+const statusEl = document.getElementById("status");
+let W = 0, H = 0, DPR = 1;
+function resize() { DPR = window.devicePixelRatio || 1; W = innerWidth; H = innerHeight;
+  cv.width = W * DPR; cv.height = H * DPR; ctx.setTransform(DPR, 0, 0, DPR, 0, 0); }
+addEventListener("resize", resize); resize();
+
+// ---------- 聲音：撥弦合成（Karplus-Strong） ----------
+let audio = null, master = null;
+function initAudio() {
+  // iPhone 開著靜音鍵時，網頁聲音預設會被一起靜音；設成「播放」才會響
+  try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch {}
+  audio = new (window.AudioContext || window.webkitAudioContext)();
+  if (audio.state === "suspended") audio.resume();
+  master = audio.createGain(); master.gain.value = 0.8;
+  const comp = audio.createDynamicsCompressor();
+  // 一點點回音，讓聲音有空間感
+  const delay = audio.createDelay(); delay.delayTime.value = 0.23;
+  const fb = audio.createGain(); fb.gain.value = 0.28;
+  const wet = audio.createGain(); wet.gain.value = 0.25;
+  master.connect(comp); master.connect(delay); delay.connect(fb); fb.connect(delay); delay.connect(wet); wet.connect(comp);
+  comp.connect(audio.destination);
+}
+function pluckSound(freq, vel) {
+  if (!audio) return;
+  const sr = audio.sampleRate, dur = 2.2, n = Math.floor(sr * dur);
+  const buf = audio.createBuffer(1, n, sr), out = buf.getChannelData(0);
+  const period = Math.max(2, Math.round(sr / freq));
+  const line = new Float32Array(period);
+  for (let i = 0; i < period; i++) line[i] = Math.random() * 2 - 1;
+  const decay = 0.996 - Math.min(0.01, freq / 200000);
+  let idx = 0, prev = 0;
+  for (let i = 0; i < n; i++) {
+    const cur = line[idx];
+    const nxt = line[(idx + 1) % period];
+    line[idx] = decay * 0.5 * (cur + nxt);
+    out[i] = cur; idx = (idx + 1) % period; prev = cur;
+  }
+  const src = audio.createBufferSource(); src.buffer = buf;
+  const g = audio.createGain(); g.gain.value = 0.25 + 0.55 * Math.min(1, vel);
+  const lp = audio.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 2500 + 5000 * Math.min(1, vel);
+  src.connect(lp); lp.connect(g); g.connect(master); src.start();
+}
+
+// ---------- 音高：弦越長音越低 ----------
+function pitchOf(len) {
+  const diag = Math.hypot(W, H);
+  const norm = Math.max(0.02, len / diag);
+  let f = 329.63 * (0.35 / norm);            // 畫面對角線 35% 長的弦 = E4
+  f = Math.min(1975, Math.max(82.4, f));      // E2 到 B6
+  const midi = Math.round(69 + 12 * Math.log2(f / 440));
+  const snapped = 440 * Math.pow(2, (midi - 69) / 12);
+  return { f: snapped, name: NOTE[midi % 12] + (Math.floor(midi / 12) - 1) };
+}
+
+// ---------- 弦 ----------
+const strings = [];   // {a:{x,y}, b:{x,y}, hue, amp, phase, lastPluck}
+let pending = null;   // 雙手捏住時正在拉的那一條
+const particles = [];
+function addString(a, b) {
+  strings.push({ a: { ...a }, b: { ...b }, hue: 140 + Math.random() * 180, amp: 0, phase: 0, lastPluck: 0 });
+  while (strings.length > MAX_STRINGS) strings.shift();
+}
+function pluck(s, x, y, vel) {
+  const now = performance.now();
+  if (now - s.lastPluck < 110) return;
+  s.lastPluck = now;
+  const p = pitchOf(dist(s.a, s.b));
+  pluckSound(p.f, vel);
+  s.amp = 6 + 10 * Math.min(1, vel); s.phase = 0;
+  for (let i = 0; i < 14; i++) particles.push({ x, y, vx: (Math.random() - .5) * 5, vy: (Math.random() - .5) * 5, life: 1, hue: s.hue });
+}
+const dist = (p, q) => Math.hypot(p.x - q.x, p.y - q.y);
+function cross(o, a, b) { return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x); }
+function segmentsCross(p1, p2, q1, q2) {
+  const d1 = cross(q1, q2, p1), d2 = cross(q1, q2, p2), d3 = cross(p1, p2, q1), d4 = cross(p1, p2, q2);
+  // 剛好停在弦上（乘積為 0）也算劃到；兩端都是 0 代表沿著弦走，不算
+  return (d1 * d2 <= 0 && !(d1 === 0 && d2 === 0)) && (d3 * d4 <= 0 && !(d3 === 0 && d4 === 0));
+}
+// 一個點從 prev 動到 cur，劃過哪幾條弦就撥哪幾條
+function checkSwipe(prev, cur, dt) {
+  if (!prev) return 0;
+  const speed = dist(prev, cur) / Math.max(dt, 8);  // 像素 / 毫秒
+  let hit = 0;
+  for (const s of strings) if (segmentsCross(prev, cur, s.a, s.b)) { pluck(s, cur.x, cur.y, speed / 2.5); hit++; }
+  return hit;
+}
+
+// ---------- 手的狀態 ----------
+let landmarker = null, camOK = false;
+const hands = {};  // key: "Left"/"Right" -> {pinched, pinchPt, grab:{s,end}, tipsPrev:[], pts:[]}
+function toScreen(lm) {
+  // 影片以 cover 方式鋪滿並左右鏡像
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const sc = Math.max(W / vw, H / vh), ox = (W - vw * sc) / 2, oy = (H - vh * sc) / 2;
+  return { x: (1 - lm.x) * vw * sc + ox, y: lm.y * vh * sc + oy };
+}
+function updateHands(result, dt) {
+  const seen = new Set();
+  const list = result?.landmarks || [];
+  list.forEach((lms, i) => {
+    const label = result.handedness?.[i]?.[0]?.categoryName || ("h" + i);
+    const key = seen.has(label) ? label + i : label; seen.add(key);
+    const h = hands[key] || (hands[key] = { pinched: false, grab: null, tipsPrev: [], pts: [] });
+    h.pts = lms.map(toScreen);
+    const size = dist(h.pts[0], h.pts[9]) || 1;
+    const ratio = dist(h.pts[4], h.pts[8]) / size;
+    const was = h.pinched;
+    h.pinched = was ? ratio < PINCH_OFF : ratio < PINCH_ON;
+    h.pinchPt = { x: (h.pts[4].x + h.pts[8].x) / 2, y: (h.pts[4].y + h.pts[8].y) / 2 };
+    if (h.pinched && !was) {
+      // 剛捏住：靠近某條弦的端點就抓住那一端
+      let best = null, bd = GRAB_RADIUS;
+      for (const s of strings) for (const end of ["a", "b"]) {
+        const d = dist(s[end], h.pinchPt); if (d < bd) { bd = d; best = { s, end }; }
+      }
+      h.grab = best;
+    }
+    if (!h.pinched) h.grab = null;
+    if (h.grab) { h.grab.s[h.grab.end].x = h.pinchPt.x; h.grab.s[h.grab.end].y = h.pinchPt.y; }
+    // 指尖劃過弦（捏住拉弦的那兩根不算，免得一拉就響）
+    TIPS.forEach((t, j) => {
+      const cur = h.pts[t];
+      if (!h.pinched || (t !== 4 && t !== 8)) checkSwipe(h.tipsPrev[j], cur, dt);
+      h.tipsPrev[j] = cur;
+    });
+    h.seen = true;
+  });
+  for (const k in hands) { if (!hands[k].seen) delete hands[k]; else hands[k].seen = false; }
+
+  // 雙手都捏住、而且都沒抓端點：拉出新弦
+  const free = Object.values(hands).filter(h => h.pinched && !h.grab);
+  if (free.length >= 2) {
+    pending = { a: free[0].pinchPt, b: free[1].pinchPt };
+  } else if (pending) {
+    if (dist(pending.a, pending.b) > 40) addString(pending.a, pending.b);
+    pending = null;
+  }
+}
+
+// ---------- 滑鼠與觸控（沒有鏡頭時） ----------
+// 劃過既有的弦 = 彈；在空白處拖曳 = 拉出新弦。手機沒有「游標懸停」，所以按著劃過也要能彈
+let mouseDown = null, mousePrev = null, mouseNow = null, mouseT = 0, dragPlucked = false;
+cv.addEventListener("pointerdown", e => {
+  mouseDown = { x: e.clientX, y: e.clientY }; mouseNow = { ...mouseDown }; mousePrev = { ...mouseDown };
+  mouseT = performance.now(); dragPlucked = false;
+  if (audio && audio.state === "suspended") audio.resume();
+});
+cv.addEventListener("pointermove", e => {
+  const cur = { x: e.clientX, y: e.clientY }, t = performance.now();
+  if (checkSwipe(mousePrev, cur, t - mouseT) && mouseDown) dragPlucked = true;
+  if (mouseDown) mouseNow = cur;
+  mousePrev = cur; mouseT = t;
+});
+const endDrag = () => {
+  if (mouseDown && mouseNow && !dragPlucked && dist(mouseDown, mouseNow) > 40) addString(mouseDown, mouseNow);
+  mouseDown = null; mouseNow = null; mousePrev = null;
+};
+cv.addEventListener("pointerup", endDrag);
+cv.addEventListener("pointercancel", endDrag);
+addEventListener("keydown", e => { if (e.key === "c" || e.key === "C") strings.length = 0; });
+
+// ---------- 畫 ----------
+function drawString(a, b, s, glowing) {
+  const p = pitchOf(dist(a, b));
+  const hue = s ? s.hue : 160;
+  const len = dist(a, b), nx = -(b.y - a.y) / (len || 1), ny = (b.x - a.x) / (len || 1);
+  ctx.save();
+  ctx.strokeStyle = `hsl(${hue} 85% 65%)`; ctx.shadowColor = `hsl(${hue} 90% 60%)`;
+  ctx.shadowBlur = glowing ? 18 : 10; ctx.lineWidth = glowing ? 3 : 2.2;
+  ctx.beginPath();
+  const seg = 40;
+  for (let i = 0; i <= seg; i++) {
+    const t = i / seg, env = Math.sin(Math.PI * t);
+    const off = s ? s.amp * env * Math.sin(s.phase) : 0;
+    const x = a.x + (b.x - a.x) * t + nx * off, y = a.y + (b.y - a.y) * t + ny * off;
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  }
+  ctx.stroke();
+  ctx.shadowBlur = 0; ctx.fillStyle = "#fff";
+  for (const e of [a, b]) { ctx.beginPath(); ctx.arc(e.x, e.y, 5, 0, 7); ctx.fill(); }
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2 + 18;
+  const label = `${p.name} · ${Math.round(p.f)}Hz`;
+  ctx.font = "12px -apple-system, 'PingFang TC', sans-serif";
+  const tw = ctx.measureText(label).width + 16;
+  ctx.fillStyle = "rgba(10,14,18,.75)"; ctx.fillRect(mx - tw / 2, my - 10, tw, 20);
+  ctx.fillStyle = "#e8eef2"; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText(label, mx, my);
+  ctx.restore();
+}
+function drawHand(h) {
+  ctx.save(); ctx.lineWidth = 2; ctx.strokeStyle = "#3ddc97";
+  for (const [i, j] of HAND_LINKS) { ctx.beginPath(); ctx.moveTo(h.pts[i].x, h.pts[i].y); ctx.lineTo(h.pts[j].x, h.pts[j].y); ctx.stroke(); }
+  ctx.fillStyle = "#e5484d";
+  for (const p of h.pts) { ctx.beginPath(); ctx.arc(p.x, p.y, 3.5, 0, 7); ctx.fill(); }
+  if (h.pinched) { ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(h.pinchPt.x, h.pinchPt.y, 11, 0, 7); ctx.stroke(); }
+  ctx.restore();
+}
+function drawVideo() {
+  if (!camOK || video.readyState < 2) { ctx.fillStyle = "#0b0d10"; ctx.fillRect(0, 0, W, H); return; }
+  const vw = video.videoWidth, vh = video.videoHeight, sc = Math.max(W / vw, H / vh);
+  ctx.save(); ctx.translate(W, 0); ctx.scale(-1, 1);
+  ctx.drawImage(video, (W - vw * sc) / 2, (H - vh * sc) / 2, vw * sc, vh * sc);
+  ctx.restore();
+  ctx.fillStyle = "rgba(0,0,0,.25)"; ctx.fillRect(0, 0, W, H);
+}
+
+// ---------- 主迴圈 ----------
+let lastT = performance.now(), lastVideoTime = -1;
+function frame() {
+  const t = performance.now(), dt = t - lastT; lastT = t;
+  if (landmarker && camOK && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    try { updateHands(landmarker.detectForVideo(video, t), dt); } catch (e) { console.warn(e); }
+  }
+  drawVideo();
+  for (const s of strings) { s.phase += 0.9; s.amp *= 0.93; drawString(s.a, s.b, s, s.amp > 0.5); }
+  if (pending) drawString(pending.a, pending.b, null, true);
+  if (mouseDown && mouseNow) drawString(mouseDown, mouseNow, null, true);
+  for (const h of Object.values(hands)) if (h.pts.length) drawHand(h);
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i]; p.x += p.vx; p.y += p.vy; p.vy += 0.05; p.life -= 0.025;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    ctx.fillStyle = `hsla(${p.hue} 90% 70% / ${p.life})`; ctx.beginPath(); ctx.arc(p.x, p.y, 2.5, 0, 7); ctx.fill();
+  }
+  const n = Object.keys(hands).length;
+  statusEl.innerHTML = camOK
+    ? `雙手追蹤中 · 看到 <b>${n}</b> 隻手 · <b>${strings.length}</b> 條弦`
+    : `沒有鏡頭，滑鼠模式 · <b>${strings.length}</b> 條弦`;
+  requestAnimationFrame(frame);
+}
+
+// ---------- 啟動 ----------
+document.getElementById("go").addEventListener("click", async () => {
+  document.getElementById("start").style.display = "none";
+  initAudio();
+  requestAnimationFrame(frame);
+  statusEl.textContent = "開鏡頭中";
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+    video.srcObject = stream; await video.play(); camOK = true;
+  } catch (e) { console.warn("鏡頭打不開，改用滑鼠", e); camOK = false; return; }
+  statusEl.textContent = "載入手部辨識模型中";
+  try {
+    const { FilesetResolver, HandLandmarker } = await import(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/vision_bundle.mjs`);
+    const files = await FilesetResolver.forVisionTasks(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VER}/wasm`);
+    const opts = (delegate) => ({ baseOptions: { modelAssetPath:
+      "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate },
+      runningMode: "VIDEO", numHands: 2 });
+    try { landmarker = await HandLandmarker.createFromOptions(files, opts("GPU")); }
+    catch { landmarker = await HandLandmarker.createFromOptions(files, opts("CPU")); }
+  } catch (e) { console.error("手部辨識模型載入失敗", e); camOK = false; }
+});
+</script>
+</body>
+</html>
