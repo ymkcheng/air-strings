@@ -11,6 +11,9 @@
   canvas { position:fixed; inset:0; width:100vw; height:100vh; display:block; touch-action:none; }
   body { overscroll-behavior:none; -webkit-user-select:none; user-select:none; }
   @media (max-width: 600px) { #help { font-size:12px; gap:6px 14px; } #status { font-size:13px; } }
+  #clear { position:fixed; top:16px; right:16px; padding:8px 16px; border-radius:10px; border:1px solid rgba(255,255,255,.18);
+    background:var(--panel); color:var(--ink); font-size:14px; cursor:pointer; z-index:2; }
+  #clear:active { background:rgba(61,220,151,.3); }
   #status { position:fixed; top:16px; left:16px; padding:8px 14px; border-radius:10px;
     background:var(--panel); font-size:14px; }
   #status b { color:var(--accent); font-weight:600; }
@@ -28,11 +31,12 @@
 <body>
 <canvas id="c"></canvas>
 <div id="status">準備中</div>
+<button id="clear">清除</button>
 <div id="help">
   <span><b>1.</b> 雙手拇指食指捏住，拉出一條弦</span>
   <span><b>2.</b> 捏住弦的端點拉走，改變長度就改變音高（越長越低）</span>
   <span><b>3.</b> 手指劃過弦就會響</span>
-  <span>按 C 清掉所有弦</span>
+  <span><b>清除：</b>雙手張開手掌停一秒，或按右上角「清除」</span>
 </div>
 <div id="start">
   <h1>空中撥弦</h1>
@@ -182,6 +186,7 @@ function updateHands(result, dt) {
     h.seen = true;
   });
   for (const k in hands) { if (!hands[k].seen) delete hands[k]; else hands[k].seen = false; }
+  checkOpenPalms();
 
   // 雙手都捏住、而且都沒抓端點：拉出新弦
   const free = Object.values(hands).filter(h => h.pinched && !h.grab);
@@ -208,12 +213,57 @@ cv.addEventListener("pointermove", e => {
   mousePrev = cur; mouseT = t;
 });
 const endDrag = () => {
-  if (mouseDown && mouseNow && !dragPlucked && dist(mouseDown, mouseNow) > 40) addString(mouseDown, mouseNow);
+  // 有鏡頭時，拉弦只能用雙手；觸控和滑鼠只負責撥。鏡頭打不開才讓拖曳拉弦
+  if (!camOK && mouseDown && mouseNow && !dragPlucked && dist(mouseDown, mouseNow) > 40) addString(mouseDown, mouseNow);
   mouseDown = null; mouseNow = null; mousePrev = null;
 };
 cv.addEventListener("pointerup", endDrag);
 cv.addEventListener("pointercancel", endDrag);
-addEventListener("keydown", e => { if (e.key === "c" || e.key === "C") strings.length = 0; });
+addEventListener("keydown", e => { if (e.key === "c" || e.key === "C") dissolveAll(); });
+document.getElementById("clear").addEventListener("click", e => { e.stopPropagation(); dissolveAll(); });
+
+// ---------- 清除：弦散成光點 ----------
+function dissolveAll() {
+  for (const s of strings) for (let i = 0; i <= 24; i++) {
+    const t = i / 24, x = s.a.x + (s.b.x - s.a.x) * t, y = s.a.y + (s.b.y - s.a.y) * t;
+    particles.push({ x, y, vx: (Math.random() - .5) * 3, vy: -Math.random() * 2.5, life: 1, hue: s.hue });
+  }
+  strings.length = 0; pending = null;
+}
+
+// ---------- 魔法手勢：雙手張開手掌、停一秒 ----------
+const OPEN_HOLD_MS = 1000, OPEN_DRIFT = 70;  // 要停多久；手移動超過這麼多像素就重算
+let openSince = 0, openAnchor = null, openArmed = true, openProgress = 0;
+function isOpenPalm(h) {
+  if (h.pinched) return false;
+  const w = h.pts[0];
+  // 四根手指的指尖都比第二指節離手腕更遠，代表手指伸直
+  for (const [tip, pip] of [[8, 6], [12, 10], [16, 14], [20, 18]])
+    if (dist(h.pts[tip], w) < dist(h.pts[pip], w) * 1.12) return false;
+  return dist(h.pts[4], h.pts[17]) > dist(h.pts[0], h.pts[9]) * 0.9;  // 拇指也張開
+}
+function checkOpenPalms() {
+  const hs = Object.values(hands).filter(h => h.pts.length);
+  const both = hs.length >= 2 && hs.slice(0, 2).every(isOpenPalm);
+  if (!both) { openSince = 0; openProgress = 0; openArmed = true; return; }
+  const c = { x: (hs[0].pts[9].x + hs[1].pts[9].x) / 2, y: (hs[0].pts[9].y + hs[1].pts[9].y) / 2 };
+  const now = performance.now();
+  if (!openSince || dist(c, openAnchor) > OPEN_DRIFT) { openSince = now; openAnchor = c; }
+  openProgress = Math.min(1, (now - openSince) / OPEN_HOLD_MS);
+  if (openProgress >= 1 && openArmed) {
+    if (strings.length) dissolveAll();
+    openArmed = false;   // 要放下手、重新張開才會再觸發
+  }
+}
+function drawOpenProgress() {
+  if (!openProgress || !openArmed) return;
+  ctx.save(); ctx.lineWidth = 4; ctx.strokeStyle = "#3ddc97"; ctx.lineCap = "round";
+  for (const h of Object.values(hands)) if (h.pts.length) {
+    const p = h.pts[9];
+    ctx.beginPath(); ctx.arc(p.x, p.y, 34, -Math.PI / 2, -Math.PI / 2 + openProgress * Math.PI * 2); ctx.stroke();
+  }
+  ctx.restore();
+}
 
 // ---------- 畫 ----------
 function drawString(a, b, s, glowing) {
@@ -270,8 +320,9 @@ function frame() {
   drawVideo();
   for (const s of strings) { s.phase += 0.9; s.amp *= 0.93; drawString(s.a, s.b, s, s.amp > 0.5); }
   if (pending) drawString(pending.a, pending.b, null, true);
-  if (mouseDown && mouseNow) drawString(mouseDown, mouseNow, null, true);
+  if (!camOK && mouseDown && mouseNow) drawString(mouseDown, mouseNow, null, true);
   for (const h of Object.values(hands)) if (h.pts.length) drawHand(h);
+  drawOpenProgress();
   for (let i = particles.length - 1; i >= 0; i--) {
     const p = particles[i]; p.x += p.vx; p.y += p.vy; p.vy += 0.05; p.life -= 0.025;
     if (p.life <= 0) { particles.splice(i, 1); continue; }
